@@ -1,0 +1,272 @@
+---
+title: "Logistic_regression"
+format: html
+editor: visual
+---
+
+## Logistic Regression
+
+### Intro
+
+Today, we're going to dig into logistic regression a little bit. You've likely all already worked with logistic regression at one point or another, but we're going to think about it, not only as a standalone modeling technique but within the range of model complexities.
+
+```{r}
+library(tidyverse)
+library(caret)
+library(mgcv)
+library(sf)
+library(tidycensus)
+library(DHARMa)
+sf_use_s2(FALSE)
+
+sf_all_liened<-st_read("shapefiles/clean_data.shp")%>% 
+  st_transform(4326)
+
+
+Bmore_acs<-get_acs(geography = "tract", state = "MD",county = "Baltimore city",
+                              variables=c(med_inc="B19013_001",white = "B02001_002", 
+                                          black = "B02001_003", 
+                                          poverty = "B17001_002"), geometry = T, summary_var = "B01001_001"
+                   )
+
+Bmore_acs_wide<-Bmore_acs %>% 
+  select(-GEOID, -moe) %>% 
+  pivot_wider(names_from = "variable", values_from = "estimate") %>% 
+  mutate(blk_perc = black/summary_est, wht_perc = white/summary_est, pov_rate = poverty/summary_est) %>%
+  st_as_sf %>% 
+  st_transform(4326) %>% 
+  st_set_crs(4326)
+
+st_crs(sf_all_liened)<-st_crs(Bmore_acs_wide)
+
+neighborhood_boundaries<-read_sf("shapefiles/CSA_NSA_Tracts.shp") %>% 
+  st_transform(4326) %>% 
+  st_set_crs(4326)
+```
+
+This is going to be a very stats / model heavy notebook because we're focused on the "learning from data" stage in the data journalism process.
+
+We have a dataset of properties in Baltimore that had property liens put on them for non-payment of the city's property tax. This is a big deal in Baltimore. Baltimore's property tax rate is nearly twice as high as the second highest jurisdiction, and this high tax rate leads to a high rate of home auctions through the property tax system, which advocates say disproportionately affects Black residents and leads to vacancy.
+
+However, no one has actually examined this questions statistically. We did this for an investigative series at The Baltimore Banner.
+
+```{r}
+Bmore_acs_wide_f<-sf_all_liened %>%
+  st_join(Bmore_acs_wide) %>% 
+  st_join(neighborhood_boundaries) %>% 
+  filter(is.na(Neigh)==FALSE) %>% 
+  as.data.frame %>% 
+  mutate(
+    redeemed = case_when(
+      str_detect(adredmptn,"rede")~"redeemed",
+      str_detect(adredmptn,"rede")==FALSE~"not_redeemed",
+      is.na(adredmptn)~"not_redeemed"
+      ),
+    redeemed = case_when(
+      is.na(redm_dt)~redeemed,
+      is.na(redm_dt)==FALSE~"redeemed"
+    ) %>% as.factor,
+    improvements_value = as.numeric(imprvm_),
+    land_value=as.numeric(land_vl),
+    total_assess = as.numeric(tt_ssss),
+    owner_occupancy = as.factor(ownr_c_),
+    total_liens = as.numeric(ttl_lns),
+    amt_bid = as.numeric(amt_bid),
+    Neigh = Neigh %>% str_sub(1,10) %>% as_factor
+  ) %>% 
+  filter(owner_occupancy%in%c("H","N"))
+```
+
+Let's fit a simple GLM with a variety of demographic variables from the Census tract containing the tract along with variables related to the home and lien itself.
+
+```{r}
+D_mod_redeemed<-glm(
+  redeemed~
+                    black+poverty+summary_est+med_inc+
+    total_liens+amt_bid+total_assess+land_value+improvements_value+owner_occupancy,
+           family = "binomial",
+           data = Bmore_acs_wide_f )
+```
+
+Here is the summary and diagnostic plots for that model
+
+```{r}
+summary(D_mod_redeemed)
+```
+
+Plot residual diagnostics
+
+```{r fig.width=6, fig.height=6}
+par(mfrow= c(2,2))
+plot(D_mod_redeemed)
+```
+
+Do you notice anything strange about the residual plots relative to what we saw for linear regression?
+
+What could account for this?
+
+Let's go one-by-one.
+
+### Residuals vs fitted
+
+```{r}
+plot(D_mod_redeemed,1)
+```
+
+You'll notice two split paths for the residuals. This is what we're going to see with most of these diagnostic plots. Logistic regression's response is binary, and each of these paths corresponds to one class. This makes these diagnostic plots much less useful than in the linear regression case, and we're going to cover useful diagnostics for logistic and other GLMs. This will be less of a problem when we move on to GAMs, so don't feel like we wasted your time with these plots.
+
+### Q-q plot
+
+```{r}
+plot(D_mod_redeemed,2)
+```
+
+You might remember that the reason we use this plot is to check for normality of the errors, one of the assumptions of linear regression, but not of GLMs, like logistic regression. There's theory that gives approximations to what the distributions of the deviance residuals should be, and this checks against that, but they aren't reliable or useful in the same way as the linear case.
+
+### Residuals vs. leverage
+
+I'm skipping straight to residuals versus leverage, because the story is about the same for scale vs location in the binomial case. We do still very much care about outliers and high-leverage points in GLMs because they'll affect our inferences, which will ultimately strongly affect the story we tell.
+
+```{r}
+plot(D_mod_redeemed,5)
+```
+
+### What do the residuals tell us?
+
+This is where the connection between story fact-checking and diagnostic checks is clearest. We know there are points with very large residuals and points with very high leverage. What do those points look like? What characterizes them?
+
+```{r}
+cdists<-cooks.distance(D_mod_redeemed)
+plot(cdists, cex = .5, pch = 16, xlab = "Index", ylab = "Cook's distance")
+influential_to_rm <- cdists %>% sort(decreasing = T) %>% head(10) %>% names %>% as.numeric
+p_resid<-resid(D_mod_redeemed, "pearson") %>% sort(decreasing = T)
+large_resid<- as.numeric(names(which(p_resid>20)))
+D_mod_redeemed$data[c(large_resid,influential_to_rm),] %>% View
+```
+
+These are all properties with either extremely high assessed values, extremely high tax liabilities, or extremely high bids. These are not homes being liened they are commercial properties. Ultimately, what we're interested in is how the tax system affects individuals in Baltimore.
+
+This diagnostic makes clear that we're not properly executing the process (data analysis) that we're using to achieve some goal (understanding the tax sale system in Baltimore), and that's fundamentally because we've baked in analytic choices that go against our goal. We'll deal with this in a minute.
+
+### Confusion matrix
+
+A confusion matrix is a good tool for assessing how well our predictions match observation. They give not only the exact match %, but also a confidence interval for that, the no information rate, a hypothesis test of that comparison, as well as, importantly, balanced accuracy.
+
+```{r}
+pdata <- predict(D_mod_redeemed, newdata = Bmore_acs_wide_f, type = "response")
+confusionMatrix(data = as.numeric(pdata>0.5) %>% as.factor, reference = Bmore_acs_wide_f$redeemed %>% as.numeric %>% {.-1} %>% as.factor)
+```
+
+As always, these measures aren't just statistical measures for us. 77%, not bad, you might say. But look at the balanced accuracy, 55%, not nearly as good. Balanced accuracy is important because suppose we have 9,000 class 1 points and 1,000 class 2 points. A model that always predicts class 1 will be 90% accurate without having really learned anything other than class prevalence. We'd like to learn something about what's associated with the probability for a house to end up liened.
+
+### What can we do about all this?
+
+Let's start with the outliers because they're closest to the story. Given what we saw and the kinds of homes that produce high leverage and large outlier points, let's refocus our analysis on what we actually care about: homes. We can filter out houses with total liens more than \$100,000 and with assessments over \$500,000, let's say.
+
+```{r fig.width=6, fig.height=6}
+D_mod_red_f<-Bmore_acs_wide_f %>% 
+  filter(total_liens<100000, 
+         total_assess<500000, 
+         bddr_ty!="MCC")
+
+D_mod_redeemed_f<-glm(redeemed~
+                    black+poverty+summary_est+med_inc+
+                      total_liens+amt_bid+total_assess+land_value+
+                      improvements_value+owner_occupancy,
+           family = "binomial",
+           data = D_mod_red_f )
+
+
+par(mfrow=c(2,2))
+plot(D_mod_redeemed_f)
+```
+
+This immediately improves the quality of our model according to residuals v leverage plot, which is the only original diagnostic plot that fully makes sense in this setting.
+
+```{r}
+# normally, I'd use tibble here but we need more points of precision
+D_effects<-cbind(exp(coef(D_mod_redeemed_f)), exp(coef(D_mod_redeemed)))
+colnames(D_effects)<-c("New", "Old")
+D_effects
+```
+
+Let's look at total assessment. In both cases, the estimate is positive and significant. As total assessed value increases, the likelihood of redemption increases. This tells that people who can afford nicer houses get to keep those nice houses more often. How much more often?
+
+```{r}
+1.0000002^100000
+1.0000124^100000
+```
+
+Under the old model, a difference of \$100,000 made a 2% difference in the likelihood of redemption. Fine, but who cares. Now, a \$100,000 difference increases the likelihood of redemption by 2.91 times. That is a huge difference and fully affects the way we tell this story. It tells us that people who own more expensive homes are more likely to keep their home when it goes into tax sale.
+
+### DHARMa residuals
+
+Binomial models (and other GLMs), don't have as intepretable residuals as Gaussian ones, as discussed. Their flexibility in fewer assumption also makes their residuals a little harder to interpret. This is why we're going to examine the DHARMa residuals instead.
+
+DHARMa residuals, effectively, treat the model as the truth, and ask, "if the model were true, how close is our observed data to data generated from that model?" You may recognize this kind of question from other simulation techniques like parametric bootstrapping or Bayesian p-values. Some of you even mentioned this sort of thing in your answers to "What is a model?" at the beginning of the class ("a method for generating data").
+
+```{r}
+simulationOutput <- simulateResiduals(fittedModel = D_mod_redeemed_f)
+testResiduals(simulationOutput)
+```
+
+The assumptions here are different than the assumptions of linear regression. For our estimates and uncertainty bounds to be reliable, we need the DHARMa residuals to be effectively uniform, variance to be roughly equal to what is assumed by the model (this depends on *what* we're modeling), and for there, mostly, not to be outliers.
+
+In this case, the DHARMa residuals look pretty good with the exception of outliers. This is likely related to the class imbalance issue we talked about last time. I'm going to show a quick, but not necessarily reliable way of dealing with this.
+
+### Resampling
+
+One way of dealing with this is resampling data points from the less-observed class. There are better ways to do this! I'm presenting the easiest way here for a quick example of how it works.
+
+```{r}
+preds<-predict(D_mod_redeemed_f, D_mod_red_f, type="response")
+
+tib<-tibble(row = 1:nrow(D_mod_red_f), 
+       pred =  preds,
+       name =names(pred), 
+       id_lien = D_mod_red_f$id_lien) %>%
+  arrange(pred)
+
+D_mod<-D_mod_red_f %>% filter(id_lien!=26820)
+
+not_red<-D_mod %>% 
+  add_column(id = 1:nrow(.)) %>% 
+  filter(redeemed=="not_redeemed") %>% 
+  pull(id)
+
+add<-not_red[sample(1:length(not_red),20000, replace = T)]
+to_add<-D_mod[add,]
+D_mod_f<-rbind(D_mod, to_add)
+reorder_s = sample(1:nrow(D_mod_f), nrow(D_mod_f))
+D_mod_f<-D_mod_f[reorder_s,]
+
+D_mod_redeemed_f_2<-glm(redeemed~
+                    black+poverty+summary_est+med_inc+total_liens+amt_bid+
+                      total_assess+land_value+improvements_value+owner_occupancy,
+                    family = "binomial",
+                    data = D_mod_f)
+```
+
+Let's look at the new confusion matrix
+
+```{r}
+pdata <- predict(D_mod_redeemed_f_2, newdata = D_mod_f, type = "response")
+
+confusionMatrix(data = as.numeric(pdata>=0.5) %>% as.factor, reference = D_mod_f$redeemed %>% as.numeric %>% {.-1} %>% as.factor)
+```
+
+There's a trade off here. Our raw accuracy drops from 77% to 65% because we're not longer guessing that a house will be redeemed, over and over. But with that, our no information rate drops and our balanced accuracy jumps to 65%. This indicates that we're fitting the not redeemed class much, much better. That's important because ultimately what we care about is the characteristics of homes that aren't redeemed.
+
+The other problem, not explored here, but that we'll dig into later, is overfitting. Why might this process make your models more likely to overfit?
+
+How does this affect our estimates and our residuals?
+
+```{r}
+simulationOutput <- simulateResiduals(fittedModel = D_mod_redeemed_f_2)
+testResiduals(simulationOutput)
+```
+
+```{r}
+D_effects %>% data.frame %>% 
+  add_column("resamp"=exp(coef(D_mod_redeemed_f_2)))
+```
